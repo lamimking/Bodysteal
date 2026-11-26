@@ -1,0 +1,17 @@
+name: BodySteal
+version: 1.1.0
+main: com.bodysteal.BodyStealPlugin
+api-version: '1.21'
+description: Lose body parts when you die. Lose them all and get caged.
+commands:
+  laps:
+    description: BodySteal command
+    usage: /laps <create|revive|parts|giverevive|givesaw|recipes> [player]
+  recipes:
+    description: View the BodySteal recipes
+    usage: /recipes
+    aliases: [bsrecipes]
+permissions:
+  bodysteal.admin:
+    description: Use admin /laps subcommands
+    default: op
