@@ -9,6 +9,8 @@ import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.World;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.ConfigurationSection;
@@ -39,7 +41,10 @@ import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.Recipe;
+import org.bukkit.inventory.RecipeChoice;
 import org.bukkit.inventory.ShapedRecipe;
+import org.bukkit.inventory.ShapelessRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.SkullMeta;
 import org.bukkit.persistence.PersistentDataType;
@@ -49,6 +54,7 @@ import org.bukkit.potion.PotionEffectType;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -93,11 +99,11 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     }
 
     private final Map<UUID, PD> store = new HashMap<>();
-    private final Map<String, ShapedRecipe> recipes = new LinkedHashMap<>();
+    private final Map<String, Recipe> recipes = new LinkedHashMap<>();
     private final Map<String, ItemStack> display = new LinkedHashMap<>();
-    private final Map<NamespacedKey, Part> ownRecipes = new HashMap<>();
+    private final Map<String, String> titles = new LinkedHashMap<>();
     private File dataFile;
-    private NamespacedKey PART_KEY, OWNER_KEY, REVIVE_KEY, SAW_KEY, TARGET_KEY, RECIPE_KEY;
+    private NamespacedKey PART_KEY, OWNER_KEY, REVIVE_KEY, SAW_KEY, SAW_USES_KEY, BROKEN_KEY, TARGET_KEY, RECIPE_KEY, graftKey;
 
     @Override
     public void onEnable() {
@@ -105,6 +111,9 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         OWNER_KEY = new NamespacedKey(this, "part_owner");
         REVIVE_KEY = new NamespacedKey(this, "revive_item");
         SAW_KEY = new NamespacedKey(this, "bone_saw");
+        SAW_USES_KEY = new NamespacedKey(this, "saw_uses");
+        BROKEN_KEY = new NamespacedKey(this, "broken_saw");
+        graftKey = new NamespacedKey(this, "own_part");
         TARGET_KEY = new NamespacedKey(this, "revive_target");
         RECIPE_KEY = new NamespacedKey(this, "recipe_id");
         saveDefaultConfig();
@@ -112,7 +121,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         load();
         registerRecipes();
         Bukkit.getPluginManager().registerEvents(this, this);
-        Bukkit.getScheduler().runTaskTimer(this, this::tick, 40L, 40L);
+        Bukkit.getScheduler().runTaskTimer(this, this::tick, 20L, 20L);
     }
 
     @Override
@@ -174,13 +183,37 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         return it;
     }
 
-    ItemStack sawItem() {
+    int sawUses() { return Math.max(1, getConfig().getInt("saw-uses", 3)); }
+
+    ItemStack sawItem(int uses) {
         ItemStack it = new ItemStack(Material.SHEARS);
         ItemMeta m = it.getItemMeta();
         m.displayName(Component.text("Bone Saw", NamedTextColor.DARK_RED).decoration(TextDecoration.ITALIC, false));
         m.lore(List.of(Component.text("Right-click a player to saw off a part", NamedTextColor.GRAY),
-                Component.text("Single use", NamedTextColor.DARK_GRAY)));
+                Component.text("Shift + right-click to cut your own part", NamedTextColor.GRAY),
+                Component.text("Uses left: " + uses, NamedTextColor.DARK_GRAY)));
         m.getPersistentDataContainer().set(SAW_KEY, PersistentDataType.STRING, "1");
+        m.getPersistentDataContainer().set(SAW_USES_KEY, PersistentDataType.INTEGER, uses);
+        it.setItemMeta(m);
+        return it;
+    }
+
+    ItemStack brokenSawItem() {
+        ItemStack it = new ItemStack(Material.FLINT);
+        ItemMeta m = it.getItemMeta();
+        m.displayName(Component.text("Broken Bone Saw", NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false));
+        m.lore(List.of(Component.text("Craft with 2 diamonds to repair", NamedTextColor.DARK_GRAY)));
+        m.getPersistentDataContainer().set(BROKEN_KEY, PersistentDataType.STRING, "1");
+        it.setItemMeta(m);
+        return it;
+    }
+
+    ItemStack graftItem() {
+        ItemStack it = new ItemStack(Material.BONE);
+        ItemMeta m = it.getItemMeta();
+        m.displayName(Component.text("Your Own Body Part", NamedTextColor.RED).decoration(TextDecoration.ITALIC, false));
+        m.lore(List.of(Component.text("Put ANOTHER player's part in the middle", NamedTextColor.GRAY),
+                Component.text("You get your own part of that type", NamedTextColor.GRAY)));
         it.setItemMeta(m);
         return it;
     }
@@ -204,38 +237,44 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
 
     // ---------------------------------------------------------------- recipes
 
-    void add(String id, ItemStack result, Map<Character, Material> ing, String... shape) {
+    void reg(String id, String title, NamespacedKey k, Recipe r, ItemStack shown) {
+        Bukkit.removeRecipe(k);
+        Bukkit.addRecipe(r);
+        recipes.put(id, r);
+        display.put(id, shown);
+        titles.put(id, title);
+    }
+
+    void addShaped(String id, String title, ItemStack result, Map<Character, Material> ing, String... shape) {
         NamespacedKey k = new NamespacedKey(this, id);
         ShapedRecipe r = new ShapedRecipe(k, result);
         r.shape(shape);
         for (Map.Entry<Character, Material> en : ing.entrySet()) r.setIngredient(en.getKey(), en.getValue());
-        Bukkit.removeRecipe(k);
-        Bukkit.addRecipe(r);
-        recipes.put(id, r);
-        display.put(id, result);
+        reg(id, title, k, r, result);
     }
 
     void registerRecipes() {
-        add("revive_heart", reviveItem(),
+        addShaped("revive_heart", "Revive Heart", reviveItem(),
                 Map.of('D', Material.DIAMOND_BLOCK, 'T', Material.TOTEM_OF_UNDYING, 'N', Material.NETHER_STAR),
                 "DTD", "TNT", "DTD");
-        add("bone_saw", sawItem(),
+        addShaped("bone_saw", "Bone Saw", sawItem(sawUses()),
                 Map.of('I', Material.IRON_INGOT, 'B', Material.BONE, 'D', Material.DIAMOND, 'S', Material.STICK),
                 "IBI", "BDB", " S ");
 
-        // "own part" recipes: result is re-written to the crafter's own name in onCraft
-        Map<Part, Material> center = Map.of(
-                Part.LEFT_ARM, Material.GOLDEN_APPLE,
-                Part.RIGHT_ARM, Material.GLISTERING_MELON_SLICE,
-                Part.LEFT_LEG, Material.GOLDEN_CARROT,
-                Part.RIGHT_LEG, Material.RABBIT_FOOT);
-        for (Part p : Part.values()) {
-            String id = "own_" + p.name().toLowerCase();
-            add(id, partItem("Your", p, new UUID(0, 0)),
-                    Map.of('B', Material.BONE_BLOCK, 'D', Material.DIAMOND, 'C', center.get(p)),
-                    "BDB", "DCD", "BDB");
-            ownRecipes.put(new NamespacedKey(this, id), p);
-        }
+        // repair: broken saw + 2 diamonds
+        NamespacedKey fk = new NamespacedKey(this, "fix_saw");
+        ShapelessRecipe fix = new ShapelessRecipe(fk, sawItem(sawUses()));
+        fix.addIngredient(new RecipeChoice.ExactChoice(brokenSawItem()));
+        fix.addIngredient(2, Material.DIAMOND);
+        reg("fix_saw", "Repair Saw", fk, fix, sawItem(sawUses()));
+
+        // own part: the middle bone must be ANOTHER player's body part (checked in onCraft)
+        ShapedRecipe graft = new ShapedRecipe(graftKey, graftItem());
+        graft.shape("BDB", "DCD", "BDB");
+        graft.setIngredient('B', Material.BONE_BLOCK);
+        graft.setIngredient('D', Material.DIAMOND);
+        graft.setIngredient('C', Material.BONE);
+        reg("own_part", "Own Body Part", graftKey, graft, graftItem());
     }
 
     void openRecipes(Player p) {
@@ -244,7 +283,8 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         for (Map.Entry<String, ItemStack> en : display.entrySet()) {
             ItemStack it = en.getValue().clone();
             ItemMeta m = it.getItemMeta();
-            m.lore(List.of(Component.text("Click to view recipe", NamedTextColor.YELLOW)));
+            m.lore(List.of(Component.text("Recipe: " + titles.get(en.getKey()), NamedTextColor.GOLD),
+                    Component.text("Click to view", NamedTextColor.YELLOW)));
             m.getPersistentDataContainer().set(RECIPE_KEY, PersistentDataType.STRING, en.getKey());
             it.setItemMeta(m);
             inv.setItem(slot++, it);
@@ -253,15 +293,25 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     }
 
     void showRecipe(Player p, String id) {
-        ShapedRecipe r = recipes.get(id);
+        Recipe r = recipes.get(id);
         Inventory inv = Bukkit.createInventory(new RecipeMenu(), 45,
-                Component.text("Recipe: " + id.replace('_', ' ')));
-        String[] shape = r.getShape();
-        Map<Character, ItemStack> ing = r.getIngredientMap();
-        for (int row = 0; row < shape.length; row++) {
-            for (int col = 0; col < shape[row].length(); col++) {
-                ItemStack s = ing.get(shape[row].charAt(col));
-                if (s != null) inv.setItem(11 + row * 9 + col, new ItemStack(s.getType()));
+                Component.text("Recipe: " + titles.get(id)));
+        if (r instanceof ShapedRecipe sr) {
+            String[] shape = sr.getShape();
+            Map<Character, ItemStack> ing = sr.getIngredientMap();
+            for (int row = 0; row < shape.length; row++) {
+                for (int col = 0; col < shape[row].length(); col++) {
+                    ItemStack s = ing.get(shape[row].charAt(col));
+                    if (s != null) inv.setItem(11 + row * 9 + col, new ItemStack(s.getType()));
+                }
+            }
+        } else if (r instanceof ShapelessRecipe sl) {
+            int i = 0;
+            for (ItemStack s : sl.getIngredientList()) {
+                ItemStack one = s.clone();
+                one.setAmount(1);
+                inv.setItem(11 + (i / 3) * 9 + (i % 3), one);
+                i++;
             }
         }
         inv.setItem(24, display.get(id).clone());
@@ -303,11 +353,15 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         for (Part p : Part.values()) {
             if (d.lost.contains(p) || d.held.containsKey(p)) reclaim(id, p);
         }
+        boolean wasCaged = d.caged;
         d.caged = false;
         d.lost.clear();
         d.held.clear();
         Player p = Bukkit.getPlayer(id);
-        if (p != null) p.teleport(to); else d.release = true;
+        if (p != null) setJump(p, false);
+        if (wasCaged) {
+            if (p != null) p.teleport(to); else d.release = true;
+        }
         save();
     }
 
@@ -343,7 +397,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         d.held.put(slot, h);
         if (d.nextNausea == 0) d.nextNausea = System.currentTimeMillis() + rnd();
         p.sendMessage(Component.text("You attached " + nameOf(h.owner()) + "'s " + h.part().label
-                + ". It will make you nauseous now and then.", NamedTextColor.DARK_RED));
+                + ". It is not yours - you will feel sick every few seconds.", NamedTextColor.DARK_RED));
     }
 
     /** Remove the victim's next part (death or saw) and hand it to the taker, if any. */
@@ -353,7 +407,8 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         UUID ownerId = origin != null ? origin.owner() : victim.getUniqueId();
         Part ownerPart = origin != null ? origin.part() : slot;
         d.lost.add(slot);
-        victim.sendMessage(Component.text("You lost your " + slot.label + "!", NamedTextColor.RED));
+        victim.sendMessage(Component.text("You lost your " + slot.label + "! (" + (4 - d.lost.size())
+                + " parts left)", NamedTextColor.RED));
         if (taker != null) takePart(taker, ownerId, ownerPart, slot);
     }
 
@@ -371,6 +426,39 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
                     .forEach(i -> t.getWorld().dropItemNaturally(t.getLocation(), i));
             t.sendMessage(Component.text("You took " + nameOf(owner) + "'s " + ownerPart.label + ".", NamedTextColor.GOLD));
         }
+    }
+
+    void spendSaw(Player p, ItemStack hand) {
+        Integer u = hand.getItemMeta().getPersistentDataContainer().get(SAW_USES_KEY, PersistentDataType.INTEGER);
+        int left = (u == null ? sawUses() : u) - 1;
+        if (left <= 0) {
+            p.getInventory().setItemInMainHand(brokenSawItem());
+            p.sendMessage(Component.text("Your Bone Saw broke! Repair it with 2 diamonds (see /recipes).", NamedTextColor.GOLD));
+        } else {
+            p.getInventory().setItemInMainHand(sawItem(left));
+        }
+    }
+
+    /** Shift + right-click with the saw: cut your own next part and keep it as an item. */
+    void cutSelf(Player p, PD d, ItemStack hand) {
+        if (d.caged || noArms(d)) {
+            p.sendMessage(Component.text("You can't use the saw without arms.", NamedTextColor.RED));
+            return;
+        }
+        if (d.lost.size() >= 4) {
+            p.sendMessage(Component.text("There is nothing left to cut.", NamedTextColor.GRAY));
+            return;
+        }
+        Part slot = firstPresent(d);
+        Held origin = d.held.remove(slot);
+        UUID ownerId = origin != null ? origin.owner() : p.getUniqueId();
+        Part ownerPart = origin != null ? origin.part() : slot;
+        d.lost.add(slot);
+        p.getInventory().addItem(partItem(nameOf(ownerId), ownerPart, ownerId)).values()
+                .forEach(i -> p.getWorld().dropItemNaturally(p.getLocation(), i));
+        p.sendMessage(Component.text("You cut off your " + slot.label + "! (" + (4 - d.lost.size()) + " parts left)", NamedTextColor.RED));
+        spendSaw(p, hand);
+        save();
     }
 
     void usePart(Player p, PD d, ItemStack hand, String partName, String ownerStr) {
@@ -404,27 +492,39 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         save();
     }
 
-    long rnd() { return (20 + ThreadLocalRandom.current().nextInt(31)) * 60_000L; }
+    long rnd() {
+        int mn = Math.max(1, getConfig().getInt("nausea-min-seconds", 5));
+        int mx = Math.max(mn, getConfig().getInt("nausea-max-seconds", 10));
+        return (mn + ThreadLocalRandom.current().nextInt(mx - mn + 1)) * 1000L;
+    }
+
+    void setJump(Player p, boolean disabled) {
+        AttributeInstance j = p.getAttribute(Attribute.JUMP_STRENGTH);
+        if (j == null) return;
+        double want = disabled ? 0.0 : j.getDefaultValue();
+        if (j.getBaseValue() != want) j.setBaseValue(want);
+    }
 
     void eff(Player p, PotionEffectType t, int amp) {
-        p.addPotionEffect(new PotionEffect(t, 100, amp, true, false, true));
+        p.addPotionEffect(new PotionEffect(t, 60, amp, true, false, true));
     }
 
     void tick() {
         long now = System.currentTimeMillis();
+        int nauseaTicks = Math.max(1, getConfig().getInt("nausea-seconds", 4)) * 20;
         for (Player p : Bukkit.getOnlinePlayers()) {
             PD d = pd(p.getUniqueId());
-            if (d.caged) continue;
             boolean la = d.lost.contains(Part.LEFT_ARM), ra = d.lost.contains(Part.RIGHT_ARM);
             int legs = (d.lost.contains(Part.LEFT_LEG) ? 1 : 0) + (d.lost.contains(Part.RIGHT_LEG) ? 1 : 0);
+            setJump(p, !d.caged && legs == 2);               // no legs = no jumping
+            if (d.caged) continue;
             if (la) eff(p, PotionEffectType.WEAKNESS, ra ? 1 : 0);
             if (ra) eff(p, PotionEffectType.MINING_FATIGUE, getConfig().getInt("mining-fatigue-level", 3));
-            if (legs == 1) eff(p, PotionEffectType.SLOWNESS, 1);
-            if (legs == 2) { eff(p, PotionEffectType.SLOWNESS, 3); eff(p, PotionEffectType.JUMP_BOOST, 128); }
-            if (!d.held.isEmpty()) {
+            if (legs >= 1) eff(p, PotionEffectType.SLOWNESS, legs == 2 ? 3 : 1);
+            if (!d.held.isEmpty()) {                          // wearing someone else's part
                 if (d.nextNausea == 0) d.nextNausea = now + rnd();
                 else if (now >= d.nextNausea) {
-                    p.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, 300, 0));
+                    p.addPotionEffect(new PotionEffect(PotionEffectType.NAUSEA, nauseaTicks, 0, true, false, true));
                     d.nextNausea = now + rnd();
                 }
             } else d.nextNausea = 0;
@@ -448,4 +548,322 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
             }
             d.caged = true;
             save();
-            Bukkit.broadcast(Component.text(v.getName() + " lo
+            Bukkit.broadcast(Component.text(v.getName() + " lost everything and was locked in the bedrock cage!", NamedTextColor.DARK_RED));
+            return;
+        }
+        Player k = v.getKiller();
+        if (k != null && k.equals(v)) k = null;
+        strip(v, d, k);
+        save();
+    }
+
+    @EventHandler
+    public void onSaw(PlayerInteractEntityEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        Player p = e.getPlayer();
+        ItemStack hand = p.getInventory().getItemInMainHand();
+        if (tag(hand, SAW_KEY) == null) return;
+        e.setCancelled(true);
+        if (!(e.getRightClicked() instanceof Player t)) return;
+        PD pdata = pd(p.getUniqueId()), td = pd(t.getUniqueId());
+        if (pdata.caged || noArms(pdata)) {
+            p.sendMessage(Component.text("You can't use the saw without arms.", NamedTextColor.RED));
+            return;
+        }
+        if (td.caged || td.lost.size() >= 4) {
+            p.sendMessage(Component.text("There is nothing left to saw off.", NamedTextColor.GRAY));
+            return;
+        }
+        strip(t, td, p);
+        spendSaw(p, hand);
+        save();
+    }
+
+    @EventHandler
+    public void onRespawn(PlayerRespawnEvent e) {
+        PD d = pd(e.getPlayer().getUniqueId());
+        if (d.caged && cage() != null) e.setRespawnLocation(cage());
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        Player p = e.getPlayer();
+        PD d = pd(p.getUniqueId());
+        if (d.caged && cage() != null) p.teleport(cage());
+        else if (d.release) {
+            d.release = false;
+            p.teleport(p.getWorld().getSpawnLocation());
+            save();
+        }
+    }
+
+    @EventHandler
+    public void onMove(PlayerMoveEvent e) {
+        if (!e.hasChangedPosition()) return;
+        PD d = pd(e.getPlayer().getUniqueId());
+        Location to = e.getTo();
+        if (d.caged) {
+            if (cage() != null && !inCage(to)) e.setTo(cage());
+            return;
+        }
+        if (d.lost.size() >= 4) {                       // can't move at all (falling still works)
+            Location f = e.getFrom();
+            if (to.getX() != f.getX() || to.getZ() != f.getZ()) {
+                Location n = to.clone();
+                n.setX(f.getX());
+                n.setZ(f.getZ());
+                e.setTo(n);
+            }
+        }
+    }
+
+    @EventHandler
+    public void onTeleport(PlayerTeleportEvent e) {
+        if (pd(e.getPlayer().getUniqueId()).caged && e.getCause() != PlayerTeleportEvent.TeleportCause.PLUGIN)
+            e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onBreak(BlockBreakEvent e) {
+        PD d = pd(e.getPlayer().getUniqueId());
+        if (d.caged || noArms(d)) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onPlace(BlockPlaceEvent e) {
+        PD d = pd(e.getPlayer().getUniqueId());
+        if (d.caged || noArms(d)) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onHit(EntityDamageByEntityEvent e) {
+        if (e.getDamager() instanceof Player p && noArms(pd(p.getUniqueId()))) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onPickup(EntityPickupItemEvent e) {
+        if (e.getEntity() instanceof Player p && pd(p.getUniqueId()).caged) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onDrop(PlayerDropItemEvent e) {
+        if (pd(e.getPlayer().getUniqueId()).caged) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onDamage(EntityDamageEvent e) {
+        if (e.getEntity() instanceof Player p && pd(p.getUniqueId()).caged) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onHunger(FoodLevelChangeEvent e) {
+        if (e.getEntity() instanceof Player p && pd(p.getUniqueId()).caged) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onUse(PlayerInteractEvent e) {
+        Player p = e.getPlayer();
+        PD d = pd(p.getUniqueId());
+        if (d.caged) { e.setCancelled(true); return; }
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        if (e.getAction() != Action.RIGHT_CLICK_AIR && e.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        ItemStack hand = e.getItem();
+        if (hand == null) return;
+
+        if (tag(hand, SAW_KEY) != null) {
+            e.setCancelled(true);
+            if (p.isSneaking()) cutSelf(p, d, hand);
+            return;
+        }
+        String part = tag(hand, PART_KEY);
+        if (part != null) {
+            e.setCancelled(true);
+            usePart(p, d, hand, part, tag(hand, OWNER_KEY));
+            return;
+        }
+        if (tag(hand, REVIVE_KEY) != null) {
+            e.setCancelled(true);
+            openMenu(p);
+        }
+    }
+
+    void openMenu(Player p) {
+        Inventory inv = Bukkit.createInventory(new Menu(), 54, Component.text("Revive who?"));
+        for (Map.Entry<UUID, PD> en : store.entrySet()) {
+            if (!en.getValue().caged || inv.firstEmpty() < 0) continue;
+            ItemStack s = new ItemStack(Material.PLAYER_HEAD);
+            SkullMeta m = (SkullMeta) s.getItemMeta();
+            OfflinePlayer op = Bukkit.getOfflinePlayer(en.getKey());
+            m.setOwningPlayer(op);
+            m.displayName(Component.text(String.valueOf(op.getName())));
+            m.getPersistentDataContainer().set(TARGET_KEY, PersistentDataType.STRING, en.getKey().toString());
+            s.setItemMeta(m);
+            inv.addItem(s);
+        }
+        p.openInventory(inv);
+    }
+
+    @EventHandler
+    public void onMenuClick(InventoryClickEvent e) {
+        if (!(e.getInventory().getHolder() instanceof Menu)) return;
+        e.setCancelled(true);
+        String t = tag(e.getCurrentItem(), TARGET_KEY);
+        if (t == null) return;
+        Player p = (Player) e.getWhoClicked();
+        ItemStack hand = p.getInventory().getItemInMainHand();
+        p.closeInventory();
+        if (tag(hand, REVIVE_KEY) == null) return;
+        hand.setAmount(hand.getAmount() - 1);
+        UUID id = UUID.fromString(t);
+        revive(id, p.getLocation());
+        Bukkit.broadcast(Component.text(p.getName() + " revived " + nameOf(id) + "!", NamedTextColor.LIGHT_PURPLE));
+    }
+
+    @EventHandler
+    public void onRecipeClick(InventoryClickEvent e) {
+        if (!(e.getInventory().getHolder() instanceof RecipeMenu)) return;
+        e.setCancelled(true);
+        String id = tag(e.getCurrentItem(), RECIPE_KEY);
+        if (id == null) return;
+        Player p = (Player) e.getWhoClicked();
+        if (id.equals("back")) Bukkit.getScheduler().runTask(this, () -> openRecipes(p));
+        else if (recipes.containsKey(id)) Bukkit.getScheduler().runTask(this, () -> showRecipe(p, id));
+    }
+
+    @EventHandler
+    public void onGuiDrag(InventoryDragEvent e) {
+        InventoryHolder h = e.getInventory().getHolder();
+        if (h instanceof RecipeMenu || h instanceof Menu) e.setCancelled(true);
+    }
+
+    // body-part items can't be renamed or used as crafting ingredients
+    @EventHandler
+    public void onAnvil(PrepareAnvilEvent e) {
+        ItemStack a = e.getInventory().getFirstItem(), b = e.getInventory().getSecondItem();
+        if (tag(a, PART_KEY) != null || tag(b, PART_KEY) != null) e.setResult(null);
+    }
+
+    @EventHandler
+    public void onCraft(PrepareItemCraftEvent e) {
+        ItemStack[] m = e.getInventory().getMatrix();
+        boolean hasPart = false;
+        for (ItemStack i : m) if (tag(i, PART_KEY) != null) hasPart = true;
+
+        Recipe rec = e.getRecipe();
+        boolean isGraft = rec instanceof ShapedRecipe sr && sr.getKey().equals(graftKey);
+
+        if (isGraft) {
+            // own part: the middle item must be ANOTHER player's body part
+            if (!(e.getView().getPlayer() instanceof Player p)) return;
+            ItemStack center = m.length > 4 ? m[4] : null;
+            String ps = tag(center, PART_KEY);
+            if (ps == null) { e.getInventory().setResult(null); return; }
+            Part part = Part.valueOf(ps);
+            String os = tag(center, OWNER_KEY);
+            UUID owner = os == null ? new UUID(0, 0) : UUID.fromString(os);
+            PD d = pd(p.getUniqueId());
+            if (owner.equals(p.getUniqueId()) || !missingOwn(d, part)) { e.getInventory().setResult(null); return; }
+            e.getInventory().setResult(partItem(p.getName(), part, p.getUniqueId()));
+            return;
+        }
+        if (hasPart) e.getInventory().setResult(null);     // part items can't go into other recipes
+    }
+
+    // ---------------------------------------------------------------- commands
+
+    void openRecipesFor(CommandSender s) {
+        if (s instanceof Player p) openRecipes(p); else s.sendMessage("Players only.");
+    }
+
+    void help(CommandSender s) {
+        s.sendMessage(Component.text("BodySteal commands:", NamedTextColor.GOLD));
+        s.sendMessage(Component.text("/recipes  - view all recipes", NamedTextColor.YELLOW));
+        if (!s.hasPermission("bodysteal.admin")) return;
+        s.sendMessage(Component.text("/laps create  - build the ban cage where you stand", NamedTextColor.YELLOW));
+        s.sendMessage(Component.text("/laps revive <player>  - free a caged player", NamedTextColor.YELLOW));
+        s.sendMessage(Component.text("/laps parts <player>  - show a player's parts", NamedTextColor.YELLOW));
+        s.sendMessage(Component.text("/laps reset <player|all>  - give back all parts", NamedTextColor.YELLOW));
+        s.sendMessage(Component.text("/laps giverevive | givesaw | givebrokensaw", NamedTextColor.YELLOW));
+    }
+
+    @Override
+    public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+        if (c.getName().equalsIgnoreCase("recipes")) { openRecipesFor(s); return true; }
+        String sub = a.length == 0 ? "help" : a[0].toLowerCase();
+        if (sub.equals("recipes")) { openRecipesFor(s); return true; }
+        if (sub.equals("help")) { help(s); return true; }
+        if (!s.hasPermission("bodysteal.admin")) {
+            s.sendMessage(Component.text("You don't have permission for that.", NamedTextColor.RED));
+            help(s);
+            return true;
+        }
+        switch (sub) {
+            case "create" -> {
+                if (!(s instanceof Player p)) { s.sendMessage("Players only."); return true; }
+                buildCage(p.getLocation());
+                s.sendMessage(Component.text("Bedrock cage created here and set as the ban cage.", NamedTextColor.GREEN));
+            }
+            case "revive" -> {
+                if (a.length < 2) { s.sendMessage("/laps revive <player>"); return true; }
+                Location to = s instanceof Player p ? p.getLocation() : Bukkit.getWorlds().get(0).getSpawnLocation();
+                revive(Bukkit.getOfflinePlayer(a[1]).getUniqueId(), to);
+                s.sendMessage(Component.text("Revived " + a[1] + ".", NamedTextColor.GREEN));
+            }
+            case "reset" -> {
+                if (a.length < 2) { s.sendMessage("/laps reset <player|all>"); return true; }
+                Location spawn = Bukkit.getWorlds().get(0).getSpawnLocation();
+                if (a[1].equalsIgnoreCase("all")) {
+                    for (UUID id : new ArrayList<>(store.keySet())) revive(id, spawn);
+                    s.sendMessage(Component.text("Everyone has all their parts back.", NamedTextColor.GREEN));
+                } else {
+                    revive(Bukkit.getOfflinePlayer(a[1]).getUniqueId(), spawn);
+                    s.sendMessage(Component.text(a[1] + " has all their parts back.", NamedTextColor.GREEN));
+                }
+            }
+            case "parts" -> {
+                if (a.length < 2) { s.sendMessage("/laps parts <player>"); return true; }
+                PD d = pd(Bukkit.getOfflinePlayer(a[1]).getUniqueId());
+                StringBuilder h = new StringBuilder();
+                d.held.forEach((slot, he) -> h.append(slot.label).append("=").append(nameOf(he.owner())).append("'s ").append(he.part().label).append(" "));
+                s.sendMessage(Component.text(a[1] + " missing: " + d.lost + " | wearing: " + h + "| caged: " + d.caged));
+            }
+            case "giverevive" -> { if (s instanceof Player p) p.getInventory().addItem(reviveItem()); }
+            case "givesaw" -> { if (s instanceof Player p) p.getInventory().addItem(sawItem(sawUses())); }
+            case "givebrokensaw" -> { if (s instanceof Player p) p.getInventory().addItem(brokenSawItem()); }
+            default -> help(s);
+        }
+        return true;
+    }
+
+    List<String> playerNames() {
+        List<String> r = new ArrayList<>();
+        for (Player p : Bukkit.getOnlinePlayers()) r.add(p.getName());
+        for (Map.Entry<UUID, PD> en : store.entrySet()) {
+            if (!en.getValue().caged) continue;
+            String n = Bukkit.getOfflinePlayer(en.getKey()).getName();
+            if (n != null && !r.contains(n)) r.add(n);
+        }
+        return r;
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender s, Command c, String label, String[] a) {
+        if (!c.getName().equalsIgnoreCase("laps")) return List.of();
+        boolean admin = s.hasPermission("bodysteal.admin");
+        if (a.length == 1) {
+            List<String> opts = admin
+                    ? List.of("create", "revive", "parts", "reset", "giverevive", "givesaw", "givebrokensaw", "recipes", "help")
+                    : List.of("recipes", "help");
+            return opts.stream().filter(o -> o.startsWith(a[0].toLowerCase())).toList();
+        }
+        if (a.length == 2 && admin) {
+            String sub = a[0].toLowerCase();
+            if (sub.equals("revive") || sub.equals("parts") || sub.equals("reset")) {
+                List<String> names = playerNames();
+                if (sub.equals("reset")) names.add("all");
+                return names.stream().filter(n -> n.toLowerCase().startsWith(a[1].toLowerCase())).toList();
+            }
+        }
+        return List.of();
+    }
+}
