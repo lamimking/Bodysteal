@@ -4,8 +4,12 @@ mining-fatigue-level: 3
 # How many players/times the Bone Saw can be used before it breaks.
 saw-uses: 3
 
-# Wearing someone else's part: nausea comes back every random 5-10 seconds.
-nausea-min-seconds: 5
-nausea-max-seconds: 10
-# How long each nausea hit lasts.
+# Wearing someone else's part: nausea comes back every 10 seconds...
+nausea-interval-seconds: 10
+# ...and each hit lasts 4 seconds.
 nausea-seconds: 4
+
+# How a dropped body part looks:
+#   steve = blocky Steve arm/leg texture (needs the resource pack)
+#   skin  = player head showing the owner's real skin (works for every player, no pack needed)
+part-style: steve
