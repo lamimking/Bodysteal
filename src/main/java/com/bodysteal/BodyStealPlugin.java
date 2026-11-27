@@ -4,6 +4,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.Bukkit;
+import org.bukkit.Keyed;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
@@ -94,6 +95,12 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         @Override public Inventory getInventory() { return null; }
     }
 
+    static class SawMenu implements InventoryHolder {          // "which part to saw off" menu
+        final UUID target;
+        SawMenu(UUID target) { this.target = target; }
+        @Override public Inventory getInventory() { return null; }
+    }
+
     static class RecipeMenu implements InventoryHolder {      // recipe viewer
         @Override public Inventory getInventory() { return null; }
     }
@@ -103,7 +110,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     private final Map<String, ItemStack> display = new LinkedHashMap<>();
     private final Map<String, String> titles = new LinkedHashMap<>();
     private File dataFile;
-    private NamespacedKey PART_KEY, OWNER_KEY, REVIVE_KEY, SAW_KEY, SAW_USES_KEY, BROKEN_KEY, TARGET_KEY, RECIPE_KEY, graftKey;
+    private NamespacedKey PART_KEY, OWNER_KEY, REVIVE_KEY, SAW_KEY, SAW_USES_KEY, BROKEN_KEY, TARGET_KEY, RECIPE_KEY, SAWPICK_KEY, graftKey;
 
     @Override
     public void onEnable() {
@@ -116,6 +123,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         graftKey = new NamespacedKey(this, "own_part");
         TARGET_KEY = new NamespacedKey(this, "revive_target");
         RECIPE_KEY = new NamespacedKey(this, "recipe_id");
+        SAWPICK_KEY = new NamespacedKey(this, "saw_pick");
         saveDefaultConfig();
         dataFile = new File(getDataFolder(), "data.yml");
         load();
@@ -223,21 +231,32 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         m.lore(List.of(Component.text("Put ANOTHER player's part in the middle", NamedTextColor.GRAY),
                 Component.text("You get your own part of that type", NamedTextColor.GRAY)));
         model(m, "own_part");
+        m.getPersistentDataContainer().set(graftKey, PersistentDataType.STRING, "1");
         it.setItemMeta(m);
         return it;
     }
 
     ItemStack partItem(String ownerName, Part p, UUID owner) {
-        ItemStack it = new ItemStack(Material.BONE);
+        // part-style "steve" = blocky Steve limb texture (resource pack)
+        // part-style "skin"  = player head showing the owner's real skin
+        boolean skin = "skin".equalsIgnoreCase(getConfig().getString("part-style", "steve"));
+        ItemStack it = new ItemStack(skin ? Material.PLAYER_HEAD : Material.BONE);
         ItemMeta m = it.getItemMeta();
+        if (skin && m instanceof SkullMeta sm) sm.setOwningPlayer(Bukkit.getOfflinePlayer(owner));
         m.displayName(Component.text(ownerName + "'s " + p.label, NamedTextColor.RED).decoration(TextDecoration.ITALIC, false));
         m.lore(List.of(Component.text("Right-click while missing a part to attach it", NamedTextColor.GRAY),
                 Component.text("The owner can use it to take it back", NamedTextColor.DARK_GRAY)));
         m.getPersistentDataContainer().set(PART_KEY, PersistentDataType.STRING, p.name());
         m.getPersistentDataContainer().set(OWNER_KEY, PersistentDataType.STRING, owner.toString());
-        model(m, "part_" + p.name().toLowerCase());
+        if (!skin) model(m, "part_" + p.name().toLowerCase());
         it.setItemMeta(m);
         return it;
+    }
+
+    /** Any item that belongs to this plugin (parts, saws, revive heart, own-part item). */
+    boolean isOurs(ItemStack i) {
+        return tag(i, PART_KEY) != null || tag(i, SAW_KEY) != null || tag(i, BROKEN_KEY) != null
+                || tag(i, REVIVE_KEY) != null || tag(i, graftKey) != null;
     }
 
     String tag(ItemStack i, NamespacedKey k) {
@@ -407,12 +426,13 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
         d.held.put(slot, h);
         if (d.nextNausea == 0) d.nextNausea = System.currentTimeMillis() + rnd();
         p.sendMessage(Component.text("You attached " + nameOf(h.owner()) + "'s " + h.part().label
-                + ". It is not yours - you will feel sick every few seconds.", NamedTextColor.DARK_RED));
+                + ". It is not yours - you will feel sick every 10 seconds.", NamedTextColor.DARK_RED));
     }
 
     /** Remove the victim's next part (death or saw) and hand it to the taker, if any. */
-    void strip(Player victim, PD d, Player taker) {
-        Part slot = firstPresent(d);
+    void strip(Player victim, PD d, Player taker) { strip(victim, d, taker, firstPresent(d)); }
+
+    void strip(Player victim, PD d, Player taker, Part slot) {
         Held origin = d.held.remove(slot);
         UUID ownerId = origin != null ? origin.owner() : victim.getUniqueId();
         Part ownerPart = origin != null ? origin.part() : slot;
@@ -450,7 +470,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     }
 
     /** Shift + right-click with the saw: cut your own next part and keep it as an item. */
-    void cutSelf(Player p, PD d, ItemStack hand) {
+    void cutSelf(Player p, PD d, ItemStack hand, Part slot) {
         if (d.caged || noArms(d)) {
             p.sendMessage(Component.text("You can't use the saw without arms.", NamedTextColor.RED));
             return;
@@ -459,7 +479,10 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
             p.sendMessage(Component.text("There is nothing left to cut.", NamedTextColor.GRAY));
             return;
         }
-        Part slot = firstPresent(d);
+        if (slot == null || d.lost.contains(slot)) {
+            p.sendMessage(Component.text("That part is already gone.", NamedTextColor.GRAY));
+            return;
+        }
         Held origin = d.held.remove(slot);
         UUID ownerId = origin != null ? origin.owner() : p.getUniqueId();
         Part ownerPart = origin != null ? origin.part() : slot;
@@ -503,9 +526,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     }
 
     long rnd() {
-        int mn = Math.max(1, getConfig().getInt("nausea-min-seconds", 5));
-        int mx = Math.max(mn, getConfig().getInt("nausea-max-seconds", 10));
-        return (mn + ThreadLocalRandom.current().nextInt(mx - mn + 1)) * 1000L;
+        return Math.max(1, getConfig().getInt("nausea-interval-seconds", 10)) * 1000L;
     }
 
     void setJump(Player p, boolean disabled) {
@@ -584,9 +605,7 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
             p.sendMessage(Component.text("There is nothing left to saw off.", NamedTextColor.GRAY));
             return;
         }
-        strip(t, td, p);
-        spendSaw(p, hand);
-        save();
+        openSawMenu(p, t);
     }
 
     @EventHandler
@@ -682,7 +701,11 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
 
         if (tag(hand, SAW_KEY) != null) {
             e.setCancelled(true);
-            if (p.isSneaking()) cutSelf(p, d, hand);
+            if (p.isSneaking()) {
+                if (d.caged || noArms(d)) p.sendMessage(Component.text("You can't use the saw without arms.", NamedTextColor.RED));
+                else if (d.lost.size() >= 4) p.sendMessage(Component.text("There is nothing left to cut.", NamedTextColor.GRAY));
+                else openSawMenu(p, p);
+            }
             return;
         }
         String part = tag(hand, PART_KEY);
@@ -695,6 +718,69 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
             e.setCancelled(true);
             openMenu(p);
         }
+    }
+
+    void openSawMenu(Player p, Player target) {
+        PD td = pd(target.getUniqueId());
+        Inventory inv = Bukkit.createInventory(new SawMenu(target.getUniqueId()), 9,
+                Component.text(target.equals(p) ? "Cut off which of YOUR parts?" : "Saw off which part?"));
+        int[] slots = {1, 3, 5, 7};
+        int n = 0;
+        for (Part part : Part.values()) {
+            ItemStack it;
+            ItemMeta m;
+            if (td.lost.contains(part)) {
+                it = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
+                m = it.getItemMeta();
+                m.displayName(Component.text(part.label + " (already missing)", NamedTextColor.DARK_GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+            } else {
+                it = new ItemStack(Material.BONE);
+                m = it.getItemMeta();
+                m.displayName(Component.text(part.label, NamedTextColor.RED).decoration(TextDecoration.ITALIC, false));
+                m.lore(List.of(Component.text("Click to cut it off", NamedTextColor.GRAY)));
+                model(m, "part_" + part.name().toLowerCase());
+                m.getPersistentDataContainer().set(SAWPICK_KEY, PersistentDataType.STRING, part.name());
+            }
+            it.setItemMeta(m);
+            inv.setItem(slots[n++], it);
+        }
+        p.openInventory(inv);
+    }
+
+    @EventHandler
+    public void onSawMenuClick(InventoryClickEvent e) {
+        if (!(e.getInventory().getHolder() instanceof SawMenu sm)) return;
+        e.setCancelled(true);
+        String ps = tag(e.getCurrentItem(), SAWPICK_KEY);
+        if (ps == null) return;
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        Part part = Part.valueOf(ps);
+        ItemStack hand = p.getInventory().getItemInMainHand();
+        p.closeInventory();
+        if (tag(hand, SAW_KEY) == null) return;
+        PD pdata = pd(p.getUniqueId());
+        if (pdata.caged || noArms(pdata)) {
+            p.sendMessage(Component.text("You can't use the saw without arms.", NamedTextColor.RED));
+            return;
+        }
+        if (sm.target.equals(p.getUniqueId())) {
+            cutSelf(p, pdata, hand, part);
+            return;
+        }
+        Player t = Bukkit.getPlayer(sm.target);
+        if (t == null || !t.getWorld().equals(p.getWorld()) || t.getLocation().distance(p.getLocation()) > 6) {
+            p.sendMessage(Component.text("That player is too far away.", NamedTextColor.GRAY));
+            return;
+        }
+        PD td = pd(t.getUniqueId());
+        if (td.caged || td.lost.contains(part)) {
+            p.sendMessage(Component.text("That part is already gone.", NamedTextColor.GRAY));
+            return;
+        }
+        strip(t, td, p, part);
+        spendSaw(p, hand);
+        save();
     }
 
     void openMenu(Player p) {
@@ -743,21 +829,21 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
     @EventHandler
     public void onGuiDrag(InventoryDragEvent e) {
         InventoryHolder h = e.getInventory().getHolder();
-        if (h instanceof RecipeMenu || h instanceof Menu) e.setCancelled(true);
+        if (h instanceof RecipeMenu || h instanceof Menu || h instanceof SawMenu) e.setCancelled(true);
     }
 
-    // body-part items can't be renamed or used as crafting ingredients
+    // plugin items can't be renamed, combined or repaired in an anvil
     @EventHandler
     public void onAnvil(PrepareAnvilEvent e) {
         ItemStack a = e.getInventory().getFirstItem(), b = e.getInventory().getSecondItem();
-        if (tag(a, PART_KEY) != null || tag(b, PART_KEY) != null) e.setResult(null);
+        if (isOurs(a) || isOurs(b)) e.setResult(null);
     }
 
     @EventHandler
     public void onCraft(PrepareItemCraftEvent e) {
         ItemStack[] m = e.getInventory().getMatrix();
-        boolean hasPart = false;
-        for (ItemStack i : m) if (tag(i, PART_KEY) != null) hasPart = true;
+        boolean hasOurs = false;
+        for (ItemStack i : m) if (isOurs(i)) hasOurs = true;
 
         Recipe rec = e.getRecipe();
         boolean isGraft = rec instanceof ShapedRecipe sr && sr.getKey().equals(graftKey);
@@ -776,7 +862,10 @@ public class BodyStealPlugin extends JavaPlugin implements Listener {
             e.getInventory().setResult(partItem(p.getName(), part, p.getUniqueId()));
             return;
         }
-        if (hasPart) e.getInventory().setResult(null);     // part items can't go into other recipes
+        // plugin items (broken saw, parts, ...) can't be used in any other recipe (e.g. flint and steel)
+        boolean isFix = rec instanceof Keyed k && k.getKey().getNamespace().equals(SAW_KEY.getNamespace())
+                && k.getKey().getKey().equals("fix_saw");
+        if (hasOurs && !isFix) e.getInventory().setResult(null);
     }
 
     // ---------------------------------------------------------------- commands
