@@ -1,3 +1,0 @@
-# Mining Fatigue level (0 = I, 2 = III, 3 = IV) applied when the RIGHT arm is lost.
-# Higher = slower mining. Tune until a dirt block with a shovel takes ~10s.
-mining-fatigue-level: 3
